@@ -1,10 +1,12 @@
 import logging
 import os
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 
 load_dotenv()
 
@@ -22,8 +24,19 @@ _UPSTREAM_MODEL = "qwen/qwen3-coder:free"
 _UPSTREAM_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 
+class ChatRequest(BaseModel):
+    # Declare the fields Swagger should show; extra fields pass through unchanged.
+    model_config = ConfigDict(extra="allow")
+
+    messages: list[dict[str, Any]]
+    model: str | None = None
+    stream: bool = False
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(body: ChatRequest) -> JSONResponse:
     if not _UPSTREAM_KEY:
         logger.error("OPENROUTER_API_KEY is not set")
         return JSONResponse(
@@ -31,17 +44,17 @@ async def chat_completions(request: Request) -> JSONResponse:
             content={"error": {"message": "OPENROUTER_API_KEY is not configured", "type": "configuration_error"}},
         )
 
-    payload = await request.json()
-
-    # Replace whatever model the caller named with the upstream's actual model id.
-    payload["model"] = _UPSTREAM_MODEL
-
     # Streaming is not supported in M1 — reject cleanly so the caller knows.
-    if payload.get("stream", False):
+    if body.stream:
         return JSONResponse(
             status_code=400,
             content={"error": {"message": "Streaming is not supported in this version. Set stream=false.", "type": "unsupported_operation"}},
         )
+
+    # Build the forwarded payload: start from all fields the caller sent,
+    # then override the model id with the upstream's actual model.
+    payload = body.model_dump(exclude_none=True)
+    payload["model"] = _UPSTREAM_MODEL
 
     headers = {
         "Authorization": f"Bearer {_UPSTREAM_KEY}",
