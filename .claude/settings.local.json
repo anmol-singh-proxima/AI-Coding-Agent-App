@@ -5,7 +5,8 @@
       "Bash(python3 -m json.tool)",
       "WebSearch",
       "WebFetch(domain:openrouter.ai)",
-      "WebFetch(domain:aireiter.com)"
+      "WebFetch(domain:aireiter.com)",
+      "Bash(python3 -)"
     ]
   }
 }
