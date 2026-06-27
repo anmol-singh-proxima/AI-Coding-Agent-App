@@ -1,5 +1,4 @@
 import logging
-import os
 
 import httpx
 from dotenv import load_dotenv
@@ -10,6 +9,7 @@ from typing import Any
 
 from app.config import load_config
 from app.sources import Source, SourceRegistry
+from app import router
 
 load_dotenv()
 
@@ -40,16 +40,41 @@ def _get_registry() -> SourceRegistry:
     return _registry
 
 
-class ChatRequest(BaseModel):
-    # Declared fields are shown in Swagger; any extra OpenAI-compatible fields
-    # (tools, top_p, etc.) are allowed and forwarded unchanged.
-    model_config = ConfigDict(extra="allow")
+class Message(BaseModel):
+    role: str
+    content: str | list[dict[str, Any]] | None = None
+    name: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
 
-    messages: list[dict[str, Any]]
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "messages": [{"role": "user", "content": "Hello, how are you?"}],
+                "stream": False,
+                "temperature": 0.7,
+                "max_tokens": 512,
+            }
+        }
+    )
+
+    messages: list[Message]
     model: str | None = None
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    top_p: float | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    stop: str | list[str] | None = None
+    n: int | None = None
+    seed: int | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    response_format: dict[str, Any] | None = None
+    user: str | None = None
 
 
 def _make_headers(source: Source) -> dict[str, str]:
@@ -63,27 +88,30 @@ def _make_headers(source: Source) -> dict[str, str]:
     return headers
 
 
-def _is_upstream_rate_limit(response: httpx.Response) -> bool:
-    """True when OpenRouter signals that the model itself is throttled by its provider.
+def _should_failover(status_code: int) -> bool:
+    """True when the failure is source-specific and the next source may succeed.
 
-    Not used in M3 (single source, no failover decision to make), but retained
-    here because M4 will use it to decide whether to try the next source.
+    We fail over on auth errors (401/403) because the issue is this source's
+    key, not our request payload. We never fail over on 400/422 because those
+    mean our payload is malformed — retrying a different source would repeat the
+    same error.
     """
-    if response.status_code != 429:
-        return False
-    try:
-        body = response.json()
-        message = body.get("error", {}).get("message", "")
-        return "Provider returned error" in message or "rate-limited upstream" in message.lower()
-    except Exception:
-        return False
+    if status_code == 429:
+        return True
+    if status_code in (401, 403):
+        return True  # key/permission issue specific to this source
+    if status_code in (502, 504):
+        return True  # gateway-generated: connection error or timeout
+    if 500 <= status_code < 600:
+        return True  # upstream server error
+    return False
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatRequest):
-    sources = _get_registry().available_sources()
-    if not sources:
-        logger.error("No sources are available — check config.yaml and API keys")
+    chain = router.select_chain(_get_registry())
+    if not chain:
+        logger.error("No sources available — check config.yaml and API keys")
         return JSONResponse(
             status_code=503,
             content={
@@ -94,21 +122,49 @@ async def chat_completions(body: ChatRequest):
             },
         )
 
-    # M3: always use the first available (highest-priority) source.
-    # M4 will add the fallover loop that tries subsequent sources on failure.
-    source = sources[0]
+    failures: list[dict] = []
+    for source in chain:
+        logger.info("Trying source=%s model=%s", source.name, source.model)
 
-    if body.stream:
-        return await _handle_streaming(body, source)
-    return await _handle_nonstreaming(body, source)
+        if body.stream:
+            result = await _handle_streaming(body, source)
+        else:
+            result = await _handle_nonstreaming(body, source)
+
+        if isinstance(result, StreamingResponse):
+            # HTTP 200 confirmed and first bytes committed — done.
+            return result
+
+        status = result.status_code
+        if _should_failover(status):
+            logger.warning(
+                "Source %s HTTP %d — failing over to next source",
+                source.name, status,
+            )
+            failures.append({"source": source.name, "status": status})
+            continue
+
+        # Non-retriable response (e.g. 400 bad request) — return directly.
+        logger.info("Source %s HTTP %d (non-retriable)", source.name, status)
+        return result
+
+    logger.error("All %d source(s) failed: %s", len(failures), failures)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": "All sources failed or are unavailable.",
+                "type": "all_sources_failed",
+                "attempts": failures,
+            }
+        },
+    )
 
 
 async def _handle_nonstreaming(body: ChatRequest, source: Source) -> JSONResponse:
     payload = body.model_dump(exclude_none=True)
     payload["model"] = source.model
     headers = _make_headers(source)
-
-    logger.info("Forwarding to source=%s model=%s", source.name, source.model)
 
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -130,24 +186,23 @@ async def _handle_nonstreaming(body: ChatRequest, source: Source) -> JSONRespons
             content={"error": {"message": f"Could not reach upstream: {exc}", "type": "connection_error"}},
         )
 
-    logger.info("Source %s responded HTTP %d", source.name, response.status_code)
+    logger.info("Source %s HTTP %d", source.name, response.status_code)
     return JSONResponse(content=response.json(), status_code=response.status_code)
 
 
 async def _handle_streaming(body: ChatRequest, source: Source):
-    """Relay SSE chunks from the upstream as they arrive.
+    """Attempt a streaming connection to source and relay SSE chunks if successful.
 
-    Failover is only possible before the first byte reaches the client — the
-    upstream status code is checked before committing to the StreamingResponse.
-    If the upstream dies mid-stream the client receives a truncated response;
-    there is no way to switch sources at that point. M4 will add multi-source
-    failover at the pre-commit stage.
+    Failover is only possible before the first byte reaches the client. We check
+    the upstream status code before committing to a StreamingResponse. If the
+    upstream returns non-200 (e.g. 429), we return a JSONResponse so the
+    failover loop in chat_completions() can try the next source. Once we return
+    a StreamingResponse (HTTP 200 confirmed), we are committed — if the upstream
+    dies mid-stream, the client receives a truncated response.
     """
     payload = body.model_dump(exclude_none=True)
     payload["model"] = source.model
     headers = _make_headers(source)
-
-    logger.info("Streaming from source=%s model=%s", source.name, source.model)
 
     client = httpx.AsyncClient(timeout=_STREAM_TIMEOUT)
     try:
@@ -178,7 +233,7 @@ async def _handle_streaming(body: ChatRequest, source: Source):
         error_body = response.json()
         await response.aclose()
         await client.aclose()
-        logger.warning("Source %s returned HTTP %d (stream)", source.name, response.status_code)
+        logger.warning("Source %s HTTP %d (stream)", source.name, response.status_code)
         return JSONResponse(content=error_body, status_code=response.status_code)
 
     # HTTP 200 — commit to streaming. Keep client + response alive for the

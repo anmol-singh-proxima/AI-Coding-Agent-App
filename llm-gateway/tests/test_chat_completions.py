@@ -2,16 +2,24 @@
 Tests for POST /v1/chat/completions
 
 All outgoing httpx calls are intercepted so no real network traffic is made.
-The source registry is replaced with a single test source so tests run without
-a real config.yaml or API keys on disk.
+The source registry is replaced with test sources so tests run without a real
+config.yaml or API keys on disk.
 
 Scenarios covered:
   1. Input validation (FastAPI/Pydantic layer)
   2. Source availability guard (no sources configured)
   3. Non-streaming: happy path, payload rewriting, field pass-through
-  4. Non-streaming: upstream error pass-through, network errors
+  4. Non-streaming: error handling with a single source
   5. Streaming: happy path, payload rewriting, SSE chunk relay
-  6. Streaming: error pass-through, network errors
+  6. Streaming: error handling with a single source
+  7. Failover: non-streaming (429/5xx/401/timeout → next source)
+  8. Failover: streaming (429/5xx/401 before first byte → next source)
+
+M4 behaviour note:
+  Retriable errors (429, 401, 403, 5xx, network timeouts/connection failures)
+  trigger the failover loop. When all sources are exhausted the gateway returns
+  503 all_sources_failed. Non-retriable errors (400, 422) are returned directly
+  to the caller because failing over would repeat the same malformed request.
 """
 from __future__ import annotations
 
@@ -41,6 +49,8 @@ def _patch_upstream(responses: list):
     """Patch httpx.AsyncClient for the non-streaming path (async-with + post()).
 
     Returns (patcher, calls) where calls records the kwargs of each post().
+    The response_iter is shared across all source attempts so multi-source
+    failover tests can supply a response per attempt.
     """
     response_iter = iter(responses)
     calls: list[dict] = []
@@ -133,6 +143,28 @@ TEST_SOURCE = Source(
     enabled=True,
 )
 
+PRIMARY_SOURCE = Source(
+    name="primary",
+    base_url="https://primary.example.com/v1",
+    model="primary-model",
+    api_key="sk-primary",
+    rpm=None,
+    rpd=None,
+    priority=1,
+    enabled=True,
+)
+
+FALLBACK_SOURCE = Source(
+    name="fallback",
+    base_url="https://fallback.example.com/v1",
+    model="fallback-model",
+    api_key="sk-fallback",
+    rpm=None,
+    rpd=None,
+    priority=2,
+    enabled=True,
+)
+
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -141,13 +173,28 @@ TEST_SOURCE = Source(
 def with_test_source(monkeypatch) -> Source:
     """Replace the live registry with a single predictable test source.
 
-    All tests get this by default. Tests that need zero sources can override
-    available_sources() on their own mock registry.
+    All tests get this by default; tests that need a different registry
+    can monkeypatch _registry themselves (their setattr runs after this
+    one and takes precedence for the duration of the test).
     """
     mock_reg = MagicMock(spec=SourceRegistry)
     mock_reg.available_sources.return_value = [TEST_SOURCE]
     monkeypatch.setattr(main_module, "_registry", mock_reg)
     return TEST_SOURCE
+
+
+@pytest.fixture
+def with_two_sources(monkeypatch):
+    """Replace the live registry with PRIMARY → FALLBACK (priority order).
+
+    Used by failover tests. Because with_test_source is autouse and runs
+    first, this fixture's monkeypatch.setattr wins for the test duration.
+    Returns (primary, fallback) so tests can check URLs/models.
+    """
+    mock_reg = MagicMock(spec=SourceRegistry)
+    mock_reg.available_sources.return_value = [PRIMARY_SOURCE, FALLBACK_SOURCE]
+    monkeypatch.setattr(main_module, "_registry", mock_reg)
+    return PRIMARY_SOURCE, FALLBACK_SOURCE
 
 
 # ── 1. Input validation ───────────────────────────────────────────────────────
@@ -280,39 +327,48 @@ class TestNonStreamingForwarding:
         assert "temperature" not in calls[0]["json"]
         assert "max_tokens" not in calls[0]["json"]
 
-    def test_upstream_error_passed_through_unchanged(self):
-        error = {"error": {"message": "Missing Authentication header", "code": 401}}
-        patcher, _ = _patch_upstream([_fake_response(401, error)])
+    def test_bad_request_returned_directly_without_failover(self):
+        # 400 is non-retriable: the payload is malformed; trying another source
+        # would produce the same error, so we return it to the caller immediately.
+        error = {"error": {"message": "messages array is required", "code": 400}}
+        patcher, calls = _patch_upstream([_fake_response(400, error)])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
-        assert resp.status_code == 401
+        assert resp.status_code == 400
         assert resp.json() == error
+        assert len(calls) == 1  # only one source was tried
 
-    def test_upstream_5xx_passed_through_unchanged(self):
-        error = {"error": {"message": "Internal Server Error"}}
-        patcher, _ = _patch_upstream([_fake_response(500, error)])
+    def test_single_source_retriable_error_returns_503(self):
+        # 5xx is retriable, but with only one source the chain exhausts → 503.
+        patcher, _ = _patch_upstream([_fake_response(500, {"error": {"message": "oops"}})])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
-        assert resp.status_code == 500
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
 
 
-# ── 4. Non-streaming: network errors ─────────────────────────────────────────
+# ── 4. Non-streaming: single-source network errors ───────────────────────────
 
 
 class TestNonStreamingNetworkErrors:
-    def test_timeout_returns_504(self):
+    def test_timeout_single_source_returns_503(self):
+        # Timeout is retriable. Single source exhausted → 503 all_sources_failed.
+        # The attempts list records the gateway-side 504 status.
         patcher, _ = _patch_upstream([httpx.TimeoutException("timed out")])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
-        assert resp.status_code == 504
-        assert resp.json()["error"]["type"] == "timeout"
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+        assert resp.json()["error"]["attempts"][0]["status"] == 504
 
-    def test_connect_error_returns_502(self):
+    def test_connect_error_single_source_returns_503(self):
+        # Connection error is retriable. Single source exhausted → 503.
         patcher, _ = _patch_upstream([httpx.ConnectError("connection refused")])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
-        assert resp.status_code == 502
-        assert resp.json()["error"]["type"] == "connection_error"
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+        assert resp.json()["error"]["attempts"][0]["status"] == 502
 
 
 # ── 5. Streaming: happy path ──────────────────────────────────────────────────
@@ -377,36 +433,220 @@ class TestStreaming:
                         json={**VALID_BODY, "stream": True, "top_p": 0.9})
         assert calls[0]["json"]["top_p"] == 0.9
 
-    def test_upstream_error_passed_through_immediately(self):
-        error = {"error": {"message": "Invalid API key", "code": 401}}
-        patcher, _ = _patch_stream_upstream([_fake_stream_response(401, error_body=error)])
+    def test_bad_request_returned_directly_without_failover(self):
+        # 400 is non-retriable for streaming too.
+        error = {"error": {"message": "messages required", "code": 400}}
+        patcher, calls = _patch_stream_upstream(
+            [_fake_stream_response(400, error_body=error)]
+        )
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
-        assert resp.status_code == 401
+        assert resp.status_code == 400
         assert resp.json() == error
+        assert len(calls) == 1
 
-    def test_upstream_5xx_passed_through(self):
+    def test_single_source_retriable_error_returns_503(self):
+        # 5xx before streaming starts → retriable → chain exhausted → 503.
         error = {"error": {"message": "Internal Server Error"}}
         patcher, _ = _patch_stream_upstream([_fake_stream_response(500, error_body=error)])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
-        assert resp.status_code == 500
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
 
 
-# ── 6. Streaming: network errors ─────────────────────────────────────────────
+# ── 6. Streaming: single-source network errors ───────────────────────────────
 
 
 class TestStreamingNetworkErrors:
-    def test_timeout_returns_504(self):
+    def test_timeout_single_source_returns_503(self):
         patcher, _ = _patch_stream_upstream([httpx.TimeoutException("timed out")])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
-        assert resp.status_code == 504
-        assert resp.json()["error"]["type"] == "timeout"
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+        assert resp.json()["error"]["attempts"][0]["status"] == 504
 
-    def test_connect_error_returns_502(self):
+    def test_connect_error_single_source_returns_503(self):
         patcher, _ = _patch_stream_upstream([httpx.ConnectError("connection refused")])
         with patcher:
             resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
-        assert resp.status_code == 502
-        assert resp.json()["error"]["type"] == "connection_error"
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+        assert resp.json()["error"]["attempts"][0]["status"] == 502
+
+
+# ── 7. Failover: non-streaming ────────────────────────────────────────────────
+
+
+class TestFailover:
+    def test_429_triggers_failover_to_next_source(self, with_two_sources):
+        primary, fallback = with_two_sources
+        patcher, calls = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}),
+            _fake_response(200, {"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 200
+        assert len(calls) == 2
+        assert calls[0]["url"] == f"{primary.base_url}/chat/completions"
+        assert calls[1]["url"] == f"{fallback.base_url}/chat/completions"
+
+    def test_5xx_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_upstream([
+            _fake_response(500, {"error": {"message": "internal error"}}),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_401_triggers_failover(self, with_two_sources):
+        # Invalid key on source #1 → auth error is source-specific → try source #2.
+        patcher, calls = _patch_upstream([
+            _fake_response(401, {"error": {"message": "Unauthorized"}}),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_timeout_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_upstream([
+            httpx.TimeoutException("timed out"),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_connect_error_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_upstream([
+            httpx.ConnectError("refused"),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_bad_request_not_retried_on_next_source(self, with_two_sources):
+        # 400 means our payload is malformed — retrying another source repeats the
+        # same error, so the gateway returns 400 immediately without trying source #2.
+        error = {"error": {"message": "bad request"}}
+        patcher, calls = _patch_upstream([_fake_response(400, error)])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 400
+        assert len(calls) == 1  # fallback was NOT tried
+
+    def test_all_sources_exhausted_returns_503(self, with_two_sources):
+        patcher, _ = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}),
+            _fake_response(500, {"error": {"message": "server error"}}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+
+    def test_all_sources_failed_response_lists_both_attempts(self, with_two_sources):
+        primary, fallback = with_two_sources
+        patcher, _ = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}),
+            _fake_response(500, {"error": {"message": "server error"}}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        attempts = resp.json()["error"]["attempts"]
+        assert len(attempts) == 2
+        assert attempts[0]["source"] == primary.name
+        assert attempts[1]["source"] == fallback.name
+
+    def test_fallback_source_model_used_after_failover(self, with_two_sources):
+        primary, fallback = with_two_sources
+        patcher, calls = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert calls[1]["json"]["model"] == fallback.model
+
+
+# ── 8. Failover: streaming ────────────────────────────────────────────────────
+
+
+class TestStreamingFailover:
+    def test_429_before_stream_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_stream_upstream([
+            _fake_stream_response(429, error_body={"error": {"message": "rate limited"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_5xx_before_stream_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_stream_upstream([
+            _fake_stream_response(503, error_body={"error": {"message": "unavailable"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_401_before_stream_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_stream_upstream([
+            _fake_stream_response(401, error_body={"error": {"message": "Unauthorized"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_timeout_before_stream_triggers_failover(self, with_two_sources):
+        patcher, calls = _patch_stream_upstream([
+            httpx.TimeoutException("timed out"),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.status_code == 200
+        assert len(calls) == 2
+
+    def test_all_stream_sources_exhausted_returns_503(self, with_two_sources):
+        patcher, _ = _patch_stream_upstream([
+            _fake_stream_response(429, error_body={"error": {"message": "rate limited"}}),
+            _fake_stream_response(500, error_body={"error": {"message": "error"}}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "all_sources_failed"
+
+    def test_fallback_chunks_relayed_after_failover(self, with_two_sources):
+        patcher, _ = _patch_stream_upstream([
+            _fake_stream_response(429, error_body={"error": {"message": "rate limited"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert resp.content == b"".join(SSE_CHUNKS)
+
+    def test_fallback_source_model_used_in_stream_request(self, with_two_sources):
+        primary, fallback = with_two_sources
+        patcher, calls = _patch_stream_upstream([
+            _fake_stream_response(429, error_body={"error": {"message": "rate limited"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+        assert calls[1]["json"]["model"] == fallback.model
