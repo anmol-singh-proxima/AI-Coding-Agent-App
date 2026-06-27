@@ -1,0 +1,44 @@
+sources:
+  # Priority 1 — OpenRouter (free tier, many model options)
+  # Verify current free model IDs at: https://openrouter.ai/models?q=free
+  - name: openrouter-qwen3coder
+    base_url: https://openrouter.ai/api/v1
+    model: qwen/qwen3-coder:free
+    api_key_env: OPENROUTER_API_KEY
+    rpm: 20
+    rpd: 50           # raise to 1000 if you add $10 of OpenRouter credits
+    priority: 1
+    enabled: true
+
+  # Priority 2 — Groq (fast inference, generous free tier)
+  # Verify limits at: https://console.groq.com/settings/limits
+  - name: groq-llama
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.3-70b-versatile
+    api_key_env: GROQ_API_KEY
+    rpm: 30
+    rpd: 1000
+    priority: 2
+    enabled: true
+
+  # Priority 3 — Google Gemini (large daily quota on free tier)
+  # Verify at: https://ai.google.dev/gemini-api/docs/rate-limits
+  - name: gemini-flash
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    model: gemini-2.5-flash
+    api_key_env: GEMINI_API_KEY
+    rpm: 10
+    rpd: 1500
+    priority: 3
+    enabled: true
+
+  # Priority 99 — Local Ollama (no limits, final safety net)
+  # Requires Ollama running locally: https://ollama.ai
+  - name: ollama-local
+    base_url: http://localhost:11434/v1
+    model: devstral
+    api_key_env: ""   # no key needed for local Ollama
+    rpm: null
+    rpd: null
+    priority: 99
+    enabled: true

@@ -6,7 +6,14 @@
       "WebSearch",
       "WebFetch(domain:openrouter.ai)",
       "WebFetch(domain:aireiter.com)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(python -m pytest -v)",
+      "Bash(python3 -m pytest -v)",
+      "Bash(ls .venv/bin/)",
+      "Bash(which python3.11)",
+      "Bash(which python3.12)",
+      "Bash(ls ~/.local/bin/python*)",
+      "Bash(.venv/bin/pytest -v)"
     ]
   }
 }
