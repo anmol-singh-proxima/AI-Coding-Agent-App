@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 from typing import Any
 
 from app.config import load_config
+from app.limiter import SourceLimiter
 from app.sources import Source, SourceRegistry
 from app import router
 
@@ -28,9 +29,10 @@ _TIMEOUT = httpx.Timeout(120.0)
 # read timeout (None) because token gaps from large models can be seconds long.
 _STREAM_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=5.0)
 
-# Registry is initialised lazily on the first request so that the module can
-# be imported in tests without requiring a real config.yaml on disk.
+# Both globals are initialised lazily on the first request so that the module
+# can be imported in tests without requiring a real config.yaml on disk.
 _registry: SourceRegistry | None = None
+_limiter: SourceLimiter | None = None
 
 
 def _get_registry() -> SourceRegistry:
@@ -38,6 +40,13 @@ def _get_registry() -> SourceRegistry:
     if _registry is None:
         _registry = SourceRegistry(load_config())
     return _registry
+
+
+def _get_limiter() -> SourceLimiter:
+    global _limiter
+    if _limiter is None:
+        _limiter = SourceLimiter()
+    return _limiter
 
 
 class Message(BaseModel):
@@ -109,7 +118,7 @@ def _should_failover(status_code: int) -> bool:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(body: ChatRequest):
-    chain = router.select_chain(_get_registry())
+    chain = router.select_chain(_get_registry(), _get_limiter())
     if not chain:
         logger.error("No sources available — check config.yaml and API keys")
         return JSONResponse(
@@ -123,8 +132,10 @@ async def chat_completions(body: ChatRequest):
         )
 
     failures: list[dict] = []
+    limiter = _get_limiter()
     for source in chain:
         logger.info("Trying source=%s model=%s", source.name, source.model)
+        limiter.record(source)
 
         if body.stream:
             result = await _handle_streaming(body, source)
@@ -137,6 +148,15 @@ async def chat_completions(body: ChatRequest):
 
         status = result.status_code
         if _should_failover(status):
+            if status == 429:
+                retry_after_str = result.headers.get("retry-after")
+                retry_after: float | None = None
+                if retry_after_str:
+                    try:
+                        retry_after = float(retry_after_str)
+                    except ValueError:
+                        pass
+                limiter.mark_rate_limited(source, retry_after)
             logger.warning(
                 "Source %s HTTP %d — failing over to next source",
                 source.name, status,
@@ -159,6 +179,28 @@ async def chat_completions(body: ChatRequest):
             }
         },
     )
+
+
+@app.get("/status")
+async def status():
+    """Per-source counters and availability — useful for debugging which source served you."""
+    registry = _get_registry()
+    limiter = _get_limiter()
+    return {
+        "sources": [
+            {
+                "name": s.name,
+                "model": s.model,
+                "priority": s.priority,
+                "enabled": s.enabled,
+                "rpm": s.rpm,
+                "rpd": s.rpd,
+                "available": s.enabled and limiter.can_use(s),
+                **limiter.status(s),
+            }
+            for s in registry.all_sources()
+        ]
+    }
 
 
 async def _handle_nonstreaming(body: ChatRequest, source: Source) -> JSONResponse:
@@ -187,7 +229,15 @@ async def _handle_nonstreaming(body: ChatRequest, source: Source) -> JSONRespons
         )
 
     logger.info("Source %s HTTP %d", source.name, response.status_code)
-    return JSONResponse(content=response.json(), status_code=response.status_code)
+    extra_headers: dict[str, str] = {}
+    retry_after = response.headers.get("retry-after")
+    if retry_after:
+        extra_headers["retry-after"] = retry_after
+    return JSONResponse(
+        content=response.json(),
+        status_code=response.status_code,
+        headers=extra_headers or None,
+    )
 
 
 async def _handle_streaming(body: ChatRequest, source: Source):
@@ -231,10 +281,18 @@ async def _handle_streaming(body: ChatRequest, source: Source):
     if response.status_code != 200:
         await response.aread()
         error_body = response.json()
+        extra_headers: dict[str, str] = {}
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            extra_headers["retry-after"] = retry_after
         await response.aclose()
         await client.aclose()
         logger.warning("Source %s HTTP %d (stream)", source.name, response.status_code)
-        return JSONResponse(content=error_body, status_code=response.status_code)
+        return JSONResponse(
+            content=error_body,
+            status_code=response.status_code,
+            headers=extra_headers or None,
+        )
 
     # HTTP 200 — commit to streaming. Keep client + response alive for the
     # duration; both are closed when the generator is exhausted or cancelled.

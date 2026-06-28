@@ -1,9 +1,9 @@
 """
-Tests for POST /v1/chat/completions
+Tests for POST /v1/chat/completions and GET /status
 
 All outgoing httpx calls are intercepted so no real network traffic is made.
-The source registry is replaced with test sources so tests run without a real
-config.yaml or API keys on disk.
+The source registry and limiter are replaced with test doubles so tests run
+without a real config.yaml or API keys on disk.
 
 Scenarios covered:
   1. Input validation (FastAPI/Pydantic layer)
@@ -14,12 +14,19 @@ Scenarios covered:
   6. Streaming: error handling with a single source
   7. Failover: non-streaming (429/5xx/401/timeout → next source)
   8. Failover: streaming (429/5xx/401 before first byte → next source)
+  9. Limiter integration: record/mark_rate_limited wiring and pre-flight filtering
+  10. Status endpoint: /status returns per-source counters and availability
 
 M4 behaviour note:
   Retriable errors (429, 401, 403, 5xx, network timeouts/connection failures)
   trigger the failover loop. When all sources are exhausted the gateway returns
   503 all_sources_failed. Non-retriable errors (400, 422) are returned directly
   to the caller because failing over would repeat the same malformed request.
+
+M5 behaviour note:
+  Before each attempt, limiter.record(source) is called. On 429, the gateway
+  also calls limiter.mark_rate_limited(source, retry_after). Sources already
+  over-quota are excluded from the chain before the first attempt.
 """
 from __future__ import annotations
 
@@ -29,6 +36,7 @@ from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import app.main as main_module
+from app.limiter import SourceLimiter
 from app.main import app
 from app.sources import Source, SourceRegistry
 
@@ -37,11 +45,16 @@ CLIENT = TestClient(app)
 # ── helpers — non-streaming ───────────────────────────────────────────────────
 
 
-def _fake_response(status_code: int, body: dict) -> MagicMock:
+def _fake_response(
+    status_code: int,
+    body: dict,
+    retry_after: str | None = None,
+) -> MagicMock:
     """Minimal mock for a fully-buffered httpx.Response (client.post())."""
     r = MagicMock(spec=httpx.Response)
     r.status_code = status_code
     r.json.return_value = body
+    r.headers = httpx.Headers({"retry-after": retry_after} if retry_after else {})
     return r
 
 
@@ -80,11 +93,13 @@ def _fake_stream_response(
     status_code: int,
     chunks: list[bytes] = (),
     error_body: dict | None = None,
+    retry_after: str | None = None,
 ) -> MagicMock:
     """Minimal mock for a streaming httpx.Response (client.send(stream=True))."""
     r = MagicMock()
     r.status_code = status_code
     r.json.return_value = error_body or {}
+    r.headers = httpx.Headers({"retry-after": retry_after} if retry_after else {})
     r.aread = AsyncMock()
     r.aclose = AsyncMock()
 
@@ -171,15 +186,17 @@ FALLBACK_SOURCE = Source(
 
 @pytest.fixture(autouse=True)
 def with_test_source(monkeypatch) -> Source:
-    """Replace the live registry with a single predictable test source.
+    """Replace the live registry and limiter with single-source test doubles.
 
-    All tests get this by default; tests that need a different registry
-    can monkeypatch _registry themselves (their setattr runs after this
-    one and takes precedence for the duration of the test).
+    All tests get this by default; tests that need a different registry or
+    limiter can monkeypatch those globals themselves (their setattr runs after
+    this one and takes precedence for the duration of the test).
     """
     mock_reg = MagicMock(spec=SourceRegistry)
     mock_reg.available_sources.return_value = [TEST_SOURCE]
+    mock_reg.all_sources.return_value = [TEST_SOURCE]
     monkeypatch.setattr(main_module, "_registry", mock_reg)
+    monkeypatch.setattr(main_module, "_limiter", SourceLimiter())
     return TEST_SOURCE
 
 
@@ -193,7 +210,9 @@ def with_two_sources(monkeypatch):
     """
     mock_reg = MagicMock(spec=SourceRegistry)
     mock_reg.available_sources.return_value = [PRIMARY_SOURCE, FALLBACK_SOURCE]
+    mock_reg.all_sources.return_value = [PRIMARY_SOURCE, FALLBACK_SOURCE]
     monkeypatch.setattr(main_module, "_registry", mock_reg)
+    monkeypatch.setattr(main_module, "_limiter", SourceLimiter())
     return PRIMARY_SOURCE, FALLBACK_SOURCE
 
 
@@ -650,3 +669,145 @@ class TestStreamingFailover:
         with patcher:
             CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
         assert calls[1]["json"]["model"] == fallback.model
+
+
+# ── 9. Limiter integration ────────────────────────────────────────────────────
+
+
+class TestLimiterIntegration:
+    def test_record_called_for_each_attempt(self, monkeypatch):
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = True
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, _ = _patch_upstream([_fake_response(200, {"choices": []})])
+        with patcher:
+            CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+
+        mock_limiter.record.assert_called_once()
+
+    def test_429_calls_mark_rate_limited_on_offending_source(self, with_two_sources, monkeypatch):
+        primary, _ = with_two_sources
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = True
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, _ = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+
+        assert resp.status_code == 200
+        mock_limiter.mark_rate_limited.assert_called_once()
+        assert mock_limiter.mark_rate_limited.call_args[0][0].name == primary.name
+
+    def test_429_with_retry_after_header_passes_cooldown_to_limiter(self, with_two_sources, monkeypatch):
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = True
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, _ = _patch_upstream([
+            _fake_response(429, {"error": {"message": "rate limited"}}, retry_after="120"),
+            _fake_response(200, {"choices": []}),
+        ])
+        with patcher:
+            CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+
+        args = mock_limiter.mark_rate_limited.call_args[0]
+        assert args[1] == 120.0
+
+    def test_non_429_does_not_call_mark_rate_limited(self, monkeypatch):
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = True
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, _ = _patch_upstream([_fake_response(500, {"error": {"message": "oops"}})])
+        with patcher:
+            CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+
+        mock_limiter.mark_rate_limited.assert_not_called()
+
+    def test_limiter_blocked_source_not_attempted(self, with_two_sources, monkeypatch):
+        primary, _ = with_two_sources
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.side_effect = lambda s: s.name != primary.name
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, calls = _patch_upstream([_fake_response(200, {"choices": []})])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+
+        assert resp.status_code == 200
+        assert len(calls) == 1
+        assert primary.base_url not in calls[0]["url"]
+
+    def test_all_limiter_blocked_returns_503(self, monkeypatch):
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = False
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        resp = CLIENT.post("/v1/chat/completions", json=VALID_BODY)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "no_sources"
+
+    def test_stream_429_calls_mark_rate_limited(self, with_two_sources, monkeypatch):
+        primary, _ = with_two_sources
+        mock_limiter = MagicMock(spec=SourceLimiter)
+        mock_limiter.can_use.return_value = True
+        monkeypatch.setattr(main_module, "_limiter", mock_limiter)
+
+        patcher, _ = _patch_stream_upstream([
+            _fake_stream_response(429, error_body={"error": {"message": "rate limited"}}),
+            _fake_stream_response(200, chunks=SSE_CHUNKS),
+        ])
+        with patcher:
+            resp = CLIENT.post("/v1/chat/completions", json={**VALID_BODY, "stream": True})
+
+        assert resp.status_code == 200
+        mock_limiter.mark_rate_limited.assert_called_once()
+        assert mock_limiter.mark_rate_limited.call_args[0][0].name == primary.name
+
+
+# ── 10. Status endpoint ───────────────────────────────────────────────────────
+
+
+class TestStatusEndpoint:
+    def test_returns_200(self):
+        resp = CLIENT.get("/status")
+        assert resp.status_code == 200
+
+    def test_response_has_sources_key(self):
+        resp = CLIENT.get("/status")
+        assert "sources" in resp.json()
+
+    def test_lists_configured_source(self):
+        resp = CLIENT.get("/status")
+        sources = resp.json()["sources"]
+        assert len(sources) == 1
+        assert sources[0]["name"] == TEST_SOURCE.name
+
+    def test_source_entry_has_required_fields(self):
+        resp = CLIENT.get("/status")
+        entry = resp.json()["sources"][0]
+        for field in ("name", "model", "priority", "enabled", "rpm", "rpd",
+                      "available", "minute_count", "day_count", "in_cooldown"):
+            assert field in entry, f"missing field: {field}"
+
+    def test_enabled_source_with_no_limits_is_available(self):
+        resp = CLIENT.get("/status")
+        assert resp.json()["sources"][0]["available"] is True
+
+    def test_disabled_source_is_not_available(self, monkeypatch):
+        disabled = Source(
+            name="off", base_url="https://x.com/v1", model="m",
+            api_key="k", rpm=None, rpd=None, priority=1, enabled=False,
+        )
+        mock_reg = MagicMock(spec=SourceRegistry)
+        mock_reg.available_sources.return_value = []
+        mock_reg.all_sources.return_value = [disabled]
+        monkeypatch.setattr(main_module, "_registry", mock_reg)
+
+        resp = CLIENT.get("/status")
+        assert resp.json()["sources"][0]["available"] is False
