@@ -811,3 +811,44 @@ class TestStatusEndpoint:
 
         resp = CLIENT.get("/status")
         assert resp.json()["sources"][0]["available"] is False
+
+
+# ── 11. /v1/models endpoint ───────────────────────────────────────────────────
+
+
+class TestModelsEndpoint:
+    def test_returns_200(self):
+        resp = CLIENT.get("/v1/models")
+        assert resp.status_code == 200
+
+    def test_response_has_object_and_data_keys(self):
+        resp = CLIENT.get("/v1/models")
+        body = resp.json()
+        assert body["object"] == "list"
+        assert "data" in body
+
+    def test_lists_configured_source(self):
+        resp = CLIENT.get("/v1/models")
+        data = resp.json()["data"]
+        assert len(data) == 1
+        assert data[0]["id"] == TEST_SOURCE.name
+
+    def test_each_entry_has_required_openai_fields(self):
+        resp = CLIENT.get("/v1/models")
+        entry = resp.json()["data"][0]
+        assert entry["object"] == "model"
+        assert "id" in entry
+        assert "created" in entry
+        assert "owned_by" in entry
+
+    def test_owned_by_is_llm_gateway(self):
+        resp = CLIENT.get("/v1/models")
+        assert resp.json()["data"][0]["owned_by"] == "llm-gateway"
+
+    def test_lists_multiple_sources(self, with_two_sources):
+        resp = CLIENT.get("/v1/models")
+        data = resp.json()["data"]
+        assert len(data) == 2
+        ids = [e["id"] for e in data]
+        assert PRIMARY_SOURCE.name in ids
+        assert FALLBACK_SOURCE.name in ids

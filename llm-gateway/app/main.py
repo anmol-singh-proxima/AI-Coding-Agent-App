@@ -1,4 +1,5 @@
 import logging
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -143,7 +144,7 @@ async def chat_completions(body: ChatRequest):
             result = await _handle_nonstreaming(body, source)
 
         if isinstance(result, StreamingResponse):
-            # HTTP 200 confirmed and first bytes committed — done.
+            logger.info("Served by source=%s model=%s (stream)", source.name, source.model)
             return result
 
         status = result.status_code
@@ -164,8 +165,10 @@ async def chat_completions(body: ChatRequest):
             failures.append({"source": source.name, "status": status})
             continue
 
-        # Non-retriable response (e.g. 400 bad request) — return directly.
-        logger.info("Source %s HTTP %d (non-retriable)", source.name, status)
+        if status == 200:
+            logger.info("Served by source=%s model=%s", source.name, source.model)
+        else:
+            logger.info("Source %s returned %d (non-retriable)", source.name, status)
         return result
 
     logger.error("All %d source(s) failed: %s", len(failures), failures)
@@ -200,6 +203,29 @@ async def status():
             }
             for s in registry.all_sources()
         ]
+    }
+
+
+@app.get("/v1/models")
+async def models():
+    """OpenAI-compatible model list — Cline uses this to populate its model dropdown.
+
+    Each configured source is returned as a separate model entry. The gateway
+    ignores the model field callers send and always routes by priority, so any
+    entry here is valid to select.
+    """
+    now = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": s.name,
+                "object": "model",
+                "created": now,
+                "owned_by": "llm-gateway",
+            }
+            for s in _get_registry().all_sources()
+        ],
     }
 
 
