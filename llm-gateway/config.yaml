@@ -34,9 +34,11 @@ sources:
 
   # Priority 99 — Local Ollama (no limits, final safety net)
   # Requires Ollama running locally: https://ollama.ai
+  # qwen2.5-coder:14b is coding-specialised and only ~9GB — a good fit for a
+  # 24GB machine. Tune Ollama's memory/keep-alive via ollama.env (see README).
   - name: ollama-local
     base_url: http://localhost:11434/v1
-    model: devstral
+    model: qwen2.5-coder:14b
     api_key_env: ""   # no key needed for local Ollama
     rpm: null
     rpd: null

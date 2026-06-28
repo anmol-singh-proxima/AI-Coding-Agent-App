@@ -15,7 +15,18 @@
       "Bash(ls ~/.local/bin/python*)",
       "Bash(.venv/bin/pytest -v)",
       "Bash(python -m pytest tests/ -q)",
-      "Bash(python3 -m pytest tests/ -q)"
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(ollama list *)",
+      "Bash(ollama --version)",
+      "Bash(ollama serve *)",
+      "Bash(awk '{print $11, $12, $13}')",
+      "Bash(ollama ps *)",
+      "Bash(launchctl getenv *)",
+      "Bash(chmod +x /Users/proxima/Drive/AI-Coding-Agent-App/llm-gateway/apply-ollama-env.sh)",
+      "Bash(./apply-ollama-env.sh)",
+      "Bash(curl -s http://localhost:11434/api/generate -d '{\"model\":\"qwen2.5-coder:14b\",\"prompt\":\"say hi in one word\",\"stream\":false}')",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('response:', d.get\\('response',''\\).strip\\(\\)[:60]\\)\")",
+      "Bash(curl -s http://localhost:11434/api/generate -d '{\"model\":\"qwen2.5-coder:14b\",\"prompt\":\"hi\",\"stream\":false}')"
     ]
   }
 }

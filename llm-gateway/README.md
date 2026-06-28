@@ -126,6 +126,43 @@ Restart the gateway — the new source is active immediately.
 | `priority` | int | Lower value = tried first |
 | `enabled` | bool | Toggle without deleting the entry |
 
+## Local Ollama tuning (memory & keep-alive)
+
+The local fallback runs through Ollama. On a memory-constrained machine (e.g. a
+24GB Mac), a large model plus its KV cache can consume all RAM and freeze the UI,
+and by default Ollama keeps a model resident for 5 minutes after each request.
+Both are controlled by environment variables on the Ollama **server**.
+
+All tunable values live in one editable file, [`ollama.env`](ollama.env):
+
+| Variable | Purpose |
+|---|---|
+| `OLLAMA_KEEP_ALIVE` | How long a model stays in RAM after its last request (`0`, `30s`, `1m`, `5m`…). Shorter frees memory sooner. |
+| `OLLAMA_CONTEXT_LENGTH` | Default context window. The biggest lever on RAM — the KV cache grows linearly with it. |
+| `OLLAMA_FLASH_ATTENTION` | `1` = more memory-efficient KV cache. Required for KV-cache quantization. |
+| `OLLAMA_KV_CACHE_TYPE` | `q8_0` ≈ half the KV-cache memory at negligible quality cost (needs flash attention). |
+| `OLLAMA_MAX_LOADED_MODELS` | Cap on models resident at once. `1` prevents two big models stacking. |
+
+To change a setting, edit `ollama.env` then re-apply it:
+
+```bash
+./apply-ollama-env.sh
+```
+
+The script registers the values with `launchctl setenv` and **fully restarts**
+Ollama.app (both the GUI and the `ollama serve` subprocess) so they take effect.
+Verify with `ollama ps` after a request — the `CONTEXT` and `UNTIL` columns
+should match your settings.
+
+> **Reboot note:** `launchctl setenv` values persist until you log out or reboot.
+> After a reboot, re-run `./apply-ollama-env.sh` (or add it to your Login Items)
+> to re-apply them.
+
+**Model choice matters too.** `qwen2.5-coder:14b` (~9GB, coding-specialised) is a
+much better fit for a 24GB machine than a 24B model like `devstral` (~14GB), which
+is what causes the memory pressure and freezing. The gateway's local source is set
+to `qwen2.5-coder:14b` in [`config.yaml`](config.yaml).
+
 ## Running tests
 
 ```bash
